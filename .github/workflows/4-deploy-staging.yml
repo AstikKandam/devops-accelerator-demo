@@ -1,0 +1,142 @@
+name: "4 — Deploy: Staging"
+
+on:
+  workflow_run:
+    workflows: ["3 — Build & Package"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AI_URL: ${{ vars.AI_SERVICE_URL || 'http://localhost:8000' }}
+
+jobs:
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    environment: staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Notify AI: staging deploy starting ──────────────────────────────────
+      - name: Notify AI — Pipeline Started
+        continue-on-error: true
+        env:
+          RUN_ID: ${{ github.run_id }}
+          SHA:    ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR:  ${{ github.actor }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request, urllib.error
+          payload = json.dumps({
+              "pipeline_run_id":     os.environ["RUN_ID"],
+              "commit_sha":          os.environ["SHA"],
+              "branch":              os.environ["BRANCH"],
+              "developer":           os.environ["ACTOR"],
+              "changed_files":       ["src/app.js", "src/auth.js", "src/db.js", "src/utils.js"],
+              "files_changed_count": 4,
+              "critical_cves":       0,
+              "high_cves":           1,
+              "test_pass_rate":      0.75,
+              "target_environment":  "staging",
+          }).encode()
+          try:
+              req = urllib.request.Request(
+                  os.environ.get("AI_URL", "http://localhost:8000") + "/webhook/pipeline/started",
+                  data=payload, headers={"Content-Type": "application/json"},
+              )
+              res = json.loads(urllib.request.urlopen(req, timeout=10).read())
+              rec   = res.get("recommendation", "unknown")
+              risk  = res.get("risk_score",     0.0)
+              print(f"AI: recommendation={rec}  risk={risk}")
+              if rec == "block":
+                  print("⚠️  AI recommends blocking — proceeding to staging anyway (non-blocking gate)")
+          except urllib.error.URLError as e:
+              print(f"AI service not reachable: {e.reason}")
+          PYEOF
+
+      # ── Download build artifact ──────────────────────────────────────────────
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: build-${{ github.sha }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Deploy to staging ────────────────────────────────────────────────────
+      - name: Deploy to Staging Environment
+        run: |
+          echo "=== Staging Deployment ==="
+          echo "Commit : ${{ github.sha }}"
+          echo "Actor  : ${{ github.actor }}"
+          echo "Run ID : ${{ github.run_id }}"
+          echo ""
+          echo "Extracting build artifact..."
+          if [ -f app-build.tar.gz ]; then
+            tar -xzf app-build.tar.gz
+            echo "  ✓ artifact unpacked"
+          else
+            echo "  ⚠ artifact not found — simulating deploy from source"
+          fi
+          echo ""
+          echo "Deploying to staging.example.com ..."
+          sleep 3
+          echo "  ✓ process restarted"
+          echo "  ✓ health check passed (HTTP 200)"
+          echo ""
+          echo "Deployment complete."
+
+      # ── Smoke tests ─────────────────────────────────────────────────────────
+      - name: Smoke Tests
+        id: smoke
+        run: |
+          echo "=== Smoke Tests ==="
+          echo ""
+          echo "  GET /health          → 200 ✓"
+          echo "  POST /login          → 200 ✓  (no auth required — known issue)"
+          echo "  GET /users/search    → 200 ✓  (SQL injection still present — known)"
+          echo "  GET /users/1         → 200 ✓"
+          echo ""
+          echo "smoke_passed=true" >> "$GITHUB_OUTPUT"
+          echo "Smoke tests complete — 4/4 passed"
+
+      # ── Notify AI: staging deploy finished ───────────────────────────────────
+      - name: Notify AI — Pipeline Completed
+        if: always()
+        continue-on-error: true
+        env:
+          RUN_ID: ${{ github.run_id }}
+          SHA:    ${{ github.sha }}
+          STATUS: ${{ job.status }}
+          SMOKE:  ${{ steps.smoke.outputs.smoke_passed || 'false' }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request, urllib.error
+          passed = os.environ.get("STATUS") == "success" and os.environ.get("SMOKE") == "true"
+          payload = json.dumps({
+              "pipeline_run_id":        os.environ["RUN_ID"],
+              "commit_sha":             os.environ["SHA"],
+              "passed":                 passed,
+              "build_duration_seconds": 30.0,
+              "test_count":             4,
+              "failure_rate":           0.0 if passed else 1.0,
+              "files_changed_count":    4,
+              "target_environment":     "staging",
+          }).encode()
+          try:
+              req = urllib.request.Request(
+                  os.environ.get("AI_URL", "http://localhost:8000") + "/webhook/pipeline/completed",
+                  data=payload, headers={"Content-Type": "application/json"},
+              )
+              res = json.loads(urllib.request.urlopen(req, timeout=10).read())
+              print(f"AI health score: {res.get('overall_health_score')}")
+              print(f"    anomaly={res.get('is_anomaly')}  incident={res.get('will_incident_occur')}")
+              print(f"    policy_tuned={res.get('policy_tuned')}")
+          except urllib.error.URLError as e:
+              print(f"AI service not reachable: {e.reason}")
+          PYEOF

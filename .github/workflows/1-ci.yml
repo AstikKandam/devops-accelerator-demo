@@ -1,0 +1,151 @@
+name: "1 — CI: Test Suite"
+
+on:
+  push:
+    branches: [main, "feat/**", "fix/**"]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: "20"
+  AI_URL: ${{ vars.AI_SERVICE_URL || 'http://localhost:8000' }}
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Notify AI: pipeline is starting ─────────────────────────────────────
+      - name: Notify AI — Pipeline Started
+        continue-on-error: true
+        env:
+          RUN_ID: ${{ github.run_id }}
+          SHA:    ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR:  ${{ github.actor }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request, urllib.error
+          payload = json.dumps({
+              "pipeline_run_id":    os.environ["RUN_ID"],
+              "commit_sha":         os.environ["SHA"],
+              "branch":             os.environ["BRANCH"],
+              "developer":          os.environ["ACTOR"],
+              "changed_files":      [],
+              "files_changed_count": 5,
+          }).encode()
+          try:
+              req = urllib.request.Request(
+                  os.environ.get("AI_URL", "http://localhost:8000") + "/webhook/pipeline/started",
+                  data=payload, headers={"Content-Type": "application/json"},
+              )
+              res = json.loads(urllib.request.urlopen(req, timeout=10).read())
+              print(f"AI: recommendation={res.get('recommendation')}  risk={res.get('risk_score')}")
+              print(f"    tests selected: {len(res.get('selected_tests', []))}")
+              print(f"    test reduction: {res.get('test_reduction_pct')}%")
+          except urllib.error.URLError as e:
+              print(f"AI service not reachable: {e.reason}")
+          PYEOF
+
+      # ── Node.js setup ────────────────────────────────────────────────────────
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ── Tests (some fail intentionally) ──────────────────────────────────────
+      - name: Run test suite
+        id: tests
+        run: npm test -- --json --outputFile=test-results.json || true
+
+      - name: Parse test results
+        id: results
+        if: always()
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          try:
+              with open("test-results.json") as f:
+                  data = json.load(f)
+              passed  = data.get("numPassedTests",      0)
+              failed  = data.get("numFailedTests",       0)
+              total   = data.get("numTotalTests",        0)
+              suites  = data.get("numTotalTestSuites",   0)
+              success = data.get("success",              False)
+          except Exception as e:
+              print(f"Could not read test-results.json: {e}")
+              passed = failed = total = suites = 0
+              success = False
+
+          print(f"Results: {passed}/{total} passed | {failed} failed | {suites} suite(s)")
+          if failed:
+              print(f"Note: {failed} test(s) fail intentionally (security policy assertions)")
+
+          out = os.environ.get("GITHUB_OUTPUT", "")
+          if out:
+              with open(out, "a") as f:
+                  f.write(f"passed={passed}\n")
+                  f.write(f"failed={failed}\n")
+                  f.write(f"total={total}\n")
+                  f.write(f"success={str(success).lower()}\n")
+          PYEOF
+
+      # ── Notify AI: pipeline finished ─────────────────────────────────────────
+      - name: Notify AI — Pipeline Completed
+        if: always()
+        continue-on-error: true
+        env:
+          RUN_ID:  ${{ github.run_id }}
+          SHA:     ${{ github.sha }}
+          PASSED:  ${{ steps.results.outputs.passed  || '0' }}
+          FAILED:  ${{ steps.results.outputs.failed  || '0' }}
+          TOTAL:   ${{ steps.results.outputs.total   || '0' }}
+          SUCCESS: ${{ steps.results.outputs.success || 'false' }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request, urllib.error
+
+          passed  = int(os.environ.get("PASSED",  0))
+          failed  = int(os.environ.get("FAILED",  0))
+          total   = int(os.environ.get("TOTAL",   0))
+          success = os.environ.get("SUCCESS", "false") == "true"
+          failure_rate = round(failed / total, 4) if total else 0.0
+
+          payload = json.dumps({
+              "pipeline_run_id":        os.environ["RUN_ID"],
+              "commit_sha":             os.environ["SHA"],
+              "passed":                 success,
+              "build_duration_seconds": 90.0,
+              "test_count":             total,
+              "failure_rate":           failure_rate,
+              "alert_count":            0,
+              "files_changed_count":    5,
+          }).encode()
+          try:
+              req = urllib.request.Request(
+                  os.environ.get("AI_URL", "http://localhost:8000") + "/webhook/pipeline/completed",
+                  data=payload, headers={"Content-Type": "application/json"},
+              )
+              res = json.loads(urllib.request.urlopen(req, timeout=10).read())
+              print(f"AI health score: {res.get('overall_health_score')}")
+              print(f"    anomaly={res.get('is_anomaly')}  incident={res.get('will_incident_occur')}")
+          except urllib.error.URLError as e:
+              print(f"AI service not reachable: {e.reason}")
+          PYEOF
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_id }}
+          path: test-results.json
+          if-no-files-found: ignore

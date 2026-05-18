@@ -1,0 +1,8 @@
+node_modules/
+coverage/
+*.tar.gz
+BUILD_INFO.txt
+npm-audit.json
+test-results.json
+.env
+.env.local

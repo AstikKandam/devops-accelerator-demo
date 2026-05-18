@@ -1,0 +1,192 @@
+name: "2 — Security: SAST & Dependency Scan"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * *"   # Daily at 02:00 UTC
+
+env:
+  AI_URL: ${{ vars.AI_SERVICE_URL || 'http://localhost:8000' }}
+
+jobs:
+  scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ── npm audit ────────────────────────────────────────────────────────────
+      - name: Dependency audit (npm audit)
+        id: audit
+        run: |
+          npm audit --json > npm-audit.json 2>/dev/null || true
+          python3 << 'PYEOF'
+          import json
+          try:
+              with open("npm-audit.json") as f:
+                  data = json.load(f)
+              v = data.get("metadata", {}).get("vulnerabilities", {})
+              print(f"  critical={v.get('critical',0)}  high={v.get('high',0)}"
+                    f"  moderate={v.get('moderate',0)}  low={v.get('low',0)}")
+          except Exception as e:
+              print(f"  audit parse error: {e}")
+          PYEOF
+        continue-on-error: true
+
+      # ── Grep-based SAST (simulates Semgrep / TruffleHog) ────────────────────
+      - name: Static analysis — detect known vulnerability patterns
+        run: |
+          echo "=== SAST Scan ==="
+          echo ""
+          echo "Scanning src/ for security issues..."
+          echo ""
+          grep -rn "eval("               src/ && echo "  ↳ [HIGH]     eval() usage detected"          || true
+          grep -rn "new Function("       src/ && echo "  ↳ [HIGH]     new Function() — equiv. to eval"  || true
+          grep -rn "JWT_SECRET\s*="      src/ && echo "  ↳ [CRITICAL] Hardcoded secret in source"      || true
+          grep -rn "LIKE.*+.*query"      src/ && echo "  ↳ [CRITICAL] SQL string concatenation"         || true
+          grep -rn "password: data\."    src/ && echo "  ↳ [MEDIUM]   Plain-text password storage"      || true
+          echo ""
+          echo "Scan complete — 5 findings expected in this demo."
+
+      # ── Notify AI with the known alert + CVE payload ─────────────────────────
+      - name: Notify AI — Scan Complete
+        continue-on-error: true
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request, urllib.error
+
+          # These alerts mirror the real issues in the source code.
+          # In production: populate dynamically from Semgrep / TruffleHog SARIF output.
+          payload = json.dumps({
+              "pipeline_run_id": os.environ["RUN_ID"],
+              "alerts": [
+                  {
+                      "scanner":     "semgrep",
+                      "severity":    "high",
+                      "file_path":   "src/utils.js",
+                      "rule_id":     "javascript.lang.security.audit.eval",
+                      "description": "eval() usage — arbitrary code execution risk",
+                      "raw_score":   0.88,
+                      "has_fix":     True,
+                      "is_exposed":  True,
+                  },
+                  {
+                      "scanner":     "semgrep",
+                      "severity":    "high",
+                      "file_path":   "src/utils.js",
+                      "rule_id":     "javascript.lang.security.audit.function-constructor",
+                      "description": "new Function() is equivalent to eval() — code injection risk",
+                      "raw_score":   0.82,
+                      "has_fix":     True,
+                      "is_exposed":  True,
+                  },
+                  {
+                      "scanner":     "semgrep",
+                      "severity":    "critical",
+                      "file_path":   "src/db.js",
+                      "rule_id":     "javascript.lang.security.audit.sqli.string-concat",
+                      "description": "SQL query built by string concatenation — SQL injection risk",
+                      "raw_score":   0.95,
+                      "has_fix":     True,
+                      "is_exposed":  True,
+                  },
+                  {
+                      "scanner":     "trufflehog",
+                      "severity":    "critical",
+                      "file_path":   "src/auth.js",
+                      "rule_id":     "secret.jwt.hardcoded",
+                      "description": "Hardcoded JWT secret detected in source code",
+                      "raw_score":   0.99,
+                      "has_fix":     True,
+                      "is_exposed":  False,
+                  },
+                  {
+                      "scanner":     "semgrep",
+                      "severity":    "medium",
+                      "file_path":   "src/app.js",
+                      "rule_id":     "javascript.express.missing-input-validation",
+                      "description": "Route handler accepts user input with no validation",
+                      "raw_score":   0.60,
+                      "has_fix":     True,
+                      "is_exposed":  True,
+                  },
+                  {
+                      "scanner":     "semgrep",
+                      "severity":    "medium",
+                      "file_path":   "src/db.js",
+                      "rule_id":     "javascript.security.plaintext-password",
+                      "description": "Password stored as plain text — use bcrypt",
+                      "raw_score":   0.75,
+                      "has_fix":     True,
+                      "is_exposed":  False,
+                  },
+              ],
+              "vulns": [
+                  {
+                      "cve_id":               "CVE-2022-23529",
+                      "cvss_score":           7.5,
+                      "library_name":         "jsonwebtoken",
+                      "is_used":              True,
+                      "is_exposed":           True,
+                      "has_exploit":          True,
+                      "asset_criticality":    4,
+                      "days_since_published": 400,
+                  },
+                  {
+                      "cve_id":               "CVE-2024-29041",
+                      "cvss_score":           6.1,
+                      "library_name":         "express",
+                      "is_used":              True,
+                      "is_exposed":           True,
+                      "has_exploit":          False,
+                      "asset_criticality":    3,
+                      "days_since_published": 60,
+                  },
+              ],
+          }).encode()
+
+          try:
+              req = urllib.request.Request(
+                  os.environ.get("AI_URL", "http://localhost:8000") + "/webhook/pipeline/scan-complete",
+                  data=payload, headers={"Content-Type": "application/json"},
+              )
+              res = json.loads(urllib.request.urlopen(req, timeout=15).read())
+              block      = res.get("should_block", False)
+              reason     = res.get("block_reason", "—")
+              duplicates = res.get("duplicate_count", 0)
+              groups     = res.get("unique_groups",   0)
+
+              print(f"AI scan decision:")
+              print(f"  should_block   = {block}")
+              print(f"  block_reason   = {reason}")
+              print(f"  unique groups  = {groups}  (duplicates removed: {duplicates})")
+              print(f"  top vulns      = {res.get('top_vulns', [])}")
+              if block:
+                  print("\n⚠️  AI recommends blocking pipeline — critical findings require remediation")
+          except urllib.error.URLError as e:
+              print(f"AI service not reachable: {e.reason}")
+          PYEOF
+
+      - name: Upload audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-${{ github.run_id }}
+          path: npm-audit.json
+          if-no-files-found: ignore

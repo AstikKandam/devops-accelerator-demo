@@ -1,0 +1,108 @@
+name: "3 — Build & Package"
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AI_URL: ${{ vars.AI_SERVICE_URL || 'http://localhost:8000' }}
+
+jobs:
+  build:
+    name: Build & Upload Artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Notify AI: build starting ────────────────────────────────────────────
+      - name: Notify AI — Pipeline Started
+        continue-on-error: true
+        env:
+          RUN_ID: ${{ github.run_id }}
+          SHA:    ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR:  ${{ github.actor }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request, urllib.error
+          payload = json.dumps({
+              "pipeline_run_id":    os.environ["RUN_ID"],
+              "commit_sha":         os.environ["SHA"],
+              "branch":             os.environ["BRANCH"],
+              "developer":          os.environ["ACTOR"],
+              "changed_files":      ["src/app.js", "src/auth.js", "src/db.js", "src/utils.js"],
+              "files_changed_count": 4,
+              "critical_cves":      0,
+              "high_cves":          0,
+          }).encode()
+          try:
+              req = urllib.request.Request(
+                  os.environ.get("AI_URL", "http://localhost:8000") + "/webhook/pipeline/started",
+                  data=payload, headers={"Content-Type": "application/json"},
+              )
+              res = json.loads(urllib.request.urlopen(req, timeout=10).read())
+              print(f"AI: {res.get('recommendation')} (risk={res.get('risk_score')})")
+          except urllib.error.URLError as e:
+              print(f"AI service not reachable: {e.reason}")
+          PYEOF
+
+      # ── Build ────────────────────────────────────────────────────────────────
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install production dependencies only
+        run: npm ci --omit=dev
+
+      - name: Package application
+        run: |
+          echo "BUILD_SHA=${{ github.sha }}"       >  BUILD_INFO.txt
+          echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> BUILD_INFO.txt
+          echo "WORKFLOW_RUN=${{ github.run_id }}"  >> BUILD_INFO.txt
+          tar -czf app-build.tar.gz src/ package.json BUILD_INFO.txt
+          echo "Artifact: $(du -sh app-build.tar.gz | cut -f1)"
+
+      - name: Upload build artifact
+        id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: app-build.tar.gz
+          retention-days: 7
+
+      # ── Notify AI: build done ────────────────────────────────────────────────
+      - name: Notify AI — Pipeline Completed
+        if: always()
+        continue-on-error: true
+        env:
+          RUN_ID: ${{ github.run_id }}
+          SHA:    ${{ github.sha }}
+          STATUS: ${{ job.status }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request, urllib.error
+          payload = json.dumps({
+              "pipeline_run_id":        os.environ["RUN_ID"],
+              "commit_sha":             os.environ["SHA"],
+              "passed":                 os.environ.get("STATUS") == "success",
+              "build_duration_seconds": 45.0,
+              "test_count":             0,
+              "failure_rate":           0.0,
+              "files_changed_count":    4,
+          }).encode()
+          try:
+              req = urllib.request.Request(
+                  os.environ.get("AI_URL", "http://localhost:8000") + "/webhook/pipeline/completed",
+                  data=payload, headers={"Content-Type": "application/json"},
+              )
+              res = json.loads(urllib.request.urlopen(req, timeout=10).read())
+              print(f"AI health score: {res.get('overall_health_score')}")
+              print(f"    policy_tuned: {res.get('policy_tuned')}")
+          except urllib.error.URLError as e:
+              print(f"AI service not reachable: {e.reason}")
+          PYEOF
