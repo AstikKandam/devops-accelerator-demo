@@ -18,37 +18,64 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # need parent commit to diff changed files
 
-      # ── Notify AI: pipeline is starting ─────────────────────────────────────
+      # ── Get changed files ────────────────────────────────────────────────────
+      - name: Get changed files
+        id: changed
+        run: |
+          # diff against parent; fall back to listing all src files on first commit
+          FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git ls-files src/)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "count=$(echo "$FILES" | grep -c .)" >> $GITHUB_OUTPUT
+
+      # ── Notify AI: pipeline is starting — get test selection ─────────────────
       - name: Notify AI — Pipeline Started
+        id: ai_start
         continue-on-error: true
         env:
-          RUN_ID: ${{ github.run_id }}
-          SHA:    ${{ github.sha }}
-          BRANCH: ${{ github.ref_name }}
-          ACTOR:  ${{ github.actor }}
+          RUN_ID:        ${{ github.run_id }}
+          SHA:           ${{ github.sha }}
+          BRANCH:        ${{ github.ref_name }}
+          ACTOR:         ${{ github.actor }}
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+          FILES_COUNT:   ${{ steps.changed.outputs.count }}
         run: |
           python3 << 'PYEOF'
           import json, os, urllib.request, urllib.error
+
+          raw_files = os.environ.get("CHANGED_FILES", "")
+          changed_files = [f.strip() for f in raw_files.splitlines() if f.strip()]
+
           payload = json.dumps({
-              "pipeline_run_id":    os.environ["RUN_ID"],
-              "commit_sha":         os.environ["SHA"],
-              "branch":             os.environ["BRANCH"],
-              "developer":          os.environ["ACTOR"],
-              "changed_files":      [],
-              "files_changed_count": 5,
+              "pipeline_run_id":     os.environ["RUN_ID"],
+              "commit_sha":          os.environ["SHA"],
+              "branch":              os.environ["BRANCH"],
+              "developer":           os.environ["ACTOR"],
+              "changed_files":       changed_files,
+              "files_changed_count": int(os.environ.get("FILES_COUNT", len(changed_files))),
           }).encode()
+
+          selected_tests = []
           try:
               req = urllib.request.Request(
                   os.environ.get("AI_URL", "http://localhost:8000") + "/webhook/pipeline/started",
                   data=payload, headers={"Content-Type": "application/json"},
               )
               res = json.loads(urllib.request.urlopen(req, timeout=10).read())
+              selected_tests = res.get("selected_tests", [])
               print(f"AI: recommendation={res.get('recommendation')}  risk={res.get('risk_score')}")
-              print(f"    tests selected: {len(res.get('selected_tests', []))}")
-              print(f"    test reduction: {res.get('test_reduction_pct')}%")
+              print(f"    tests selected : {len(selected_tests)} of {res.get('total_tests')}")
+              print(f"    test reduction : {res.get('test_reduction_pct')}%")
           except urllib.error.URLError as e:
-              print(f"AI service not reachable: {e.reason}")
+              print(f"AI service not reachable: {e.reason} — will run all tests")
+
+          # Write selected tests to file for the next step to consume
+          with open("ai_selected_tests.txt", "w") as f:
+              f.write("\n".join(selected_tests))
           PYEOF
 
       # ── Node.js setup ────────────────────────────────────────────────────────
@@ -61,10 +88,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # ── Tests (some fail intentionally) ──────────────────────────────────────
+      # ── Tests: run only AI-selected suites (fall back to all if file missing) ─
       - name: Run test suite
         id: tests
-        run: npm test -- --json --outputFile=test-results.json || true
+        run: |
+          if [ -s ai_selected_tests.txt ]; then
+            # Build Jest --testPathPattern from selected test files
+            PATTERN=$(cat ai_selected_tests.txt | tr '\n' '|' | sed 's/|$//')
+            echo "Running AI-selected tests: $PATTERN"
+            npx jest --testPathPattern="$PATTERN" --json --outputFile=test-results.json || true
+          else
+            echo "No AI selection — running full test suite"
+            npm test -- --json --outputFile=test-results.json || true
+          fi
 
       - name: Parse test results
         id: results
@@ -76,19 +112,18 @@ jobs:
           try:
               with open("test-results.json") as f:
                   data = json.load(f)
-              passed  = data.get("numPassedTests",      0)
-              failed  = data.get("numFailedTests",       0)
-              total   = data.get("numTotalTests",        0)
-              suites  = data.get("numTotalTestSuites",   0)
-              success = data.get("success",              False)
+              passed  = data.get("numPassedTests",    0)
+              failed  = data.get("numFailedTests",     0)
+              total   = data.get("numTotalTests",      0)
+              success = data.get("success",            False)
           except Exception as e:
               print(f"Could not read test-results.json: {e}")
-              passed = failed = total = suites = 0
+              passed = failed = total = 0
               success = False
 
-          print(f"Results: {passed}/{total} passed | {failed} failed | {suites} suite(s)")
+          print(f"Results: {passed}/{total} passed | {failed} failed")
           if failed:
-              print(f"Note: {failed} test(s) fail intentionally (security policy assertions)")
+              print(f"Note: {failed} test(s) may fail intentionally (security policy assertions)")
 
           out = os.environ.get("GITHUB_OUTPUT", "")
           if out:
@@ -110,6 +145,7 @@ jobs:
           FAILED:  ${{ steps.results.outputs.failed  || '0' }}
           TOTAL:   ${{ steps.results.outputs.total   || '0' }}
           SUCCESS: ${{ steps.results.outputs.success || 'false' }}
+          FILES_COUNT: ${{ steps.changed.outputs.count || '1' }}
         run: |
           python3 << 'PYEOF'
           import json, os, urllib.request, urllib.error
@@ -128,7 +164,7 @@ jobs:
               "test_count":             total,
               "failure_rate":           failure_rate,
               "alert_count":            0,
-              "files_changed_count":    5,
+              "files_changed_count":    int(os.environ.get("FILES_COUNT", 1)),
           }).encode()
           try:
               req = urllib.request.Request(
