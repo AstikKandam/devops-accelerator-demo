@@ -4,24 +4,28 @@
   "description": "Deliberately insecure Node.js API — demonstrates the AI DevSecOps Control Plane",
   "main": "src/app.js",
   "scripts": {
-    "start":           "node src/server.js",
-    "dev":             "node --watch src/server.js",
-    "test":            "jest --ci --forceExit",
-    "test:watch":      "jest --watch",
-    "test:coverage":   "jest --coverage --forceExit"
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "jest --ci --forceExit",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --forceExit"
   },
   "jest": {
     "testEnvironment": "node",
-    "verbose":         true,
-    "testMatch":       ["**/tests/**/*.test.js"],
-    "testTimeout":     10000
+    "verbose": true,
+    "testMatch": [
+      "**/tests/**/*.test.js"
+    ],
+    "testTimeout": 10000
   },
   "dependencies": {
-    "express":      "^4.18.2",
-    "jsonwebtoken": "^9.0.2"
+    "axios": "^0.21.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^8.5.1",
+    "lodash": "^4.17.4"
   },
   "devDependencies": {
-    "jest":      "^29.7.0",
+    "jest": "^29.7.0",
     "supertest": "^6.3.4"
   }
 }
