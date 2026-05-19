@@ -20,29 +20,73 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # ── Detect changed files and scan for known-bad patterns ─────────────────
+      - name: Assess commit risk profile
+        id: risk_profile
+        run: |
+          FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git ls-files src/)
+          COUNT=$(echo "$FILES" | grep -c . || echo 1)
+
+          # Scan changed files for dangerous patterns
+          CRITICAL=0
+          HIGH=0
+          PASS_RATE=0.90
+
+          for f in $FILES; do
+            [ -f "$f" ] || continue
+            grep -q "eval("          "$f" && HIGH=$((HIGH+1))     || true
+            grep -q "new Function("  "$f" && HIGH=$((HIGH+1))     || true
+            grep -q "JWT_SECRET\s*=" "$f" && CRITICAL=$((CRITICAL+1)) || true
+            grep -qP "LIKE.*\+.*"    "$f" && CRITICAL=$((CRITICAL+1)) || true
+          done
+
+          # Low pass rate if dangerous files are in this commit
+          if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 2 ]; then
+            PASS_RATE=0.35
+          fi
+
+          echo "changed_files<<EOF"  >> $GITHUB_OUTPUT
+          echo "$FILES"              >> $GITHUB_OUTPUT
+          echo "EOF"                 >> $GITHUB_OUTPUT
+          echo "file_count=$COUNT"   >> $GITHUB_OUTPUT
+          echo "critical=$CRITICAL"  >> $GITHUB_OUTPUT
+          echo "high=$HIGH"          >> $GITHUB_OUTPUT
+          echo "pass_rate=$PASS_RATE" >> $GITHUB_OUTPUT
+
+          echo "Risk profile: critical_cves=$CRITICAL  high_cves=$HIGH  files=$COUNT  pass_rate=$PASS_RATE"
 
       # ── Notify AI: staging deploy starting ──────────────────────────────────
       - name: Notify AI — Pipeline Started
+        id: ai_precheck
         continue-on-error: true
         env:
-          RUN_ID: ${{ github.run_id }}
-          SHA:    ${{ github.sha }}
-          BRANCH: ${{ github.ref_name }}
-          ACTOR:  ${{ github.actor }}
+          RUN_ID:       ${{ github.run_id }}
+          SHA:          ${{ github.sha }}
+          BRANCH:       ${{ github.ref_name }}
+          ACTOR:        ${{ github.actor }}
+          FILES:        ${{ steps.risk_profile.outputs.changed_files }}
+          FILE_COUNT:   ${{ steps.risk_profile.outputs.file_count }}
+          CRITICAL_CVES: ${{ steps.risk_profile.outputs.critical }}
+          HIGH_CVES:    ${{ steps.risk_profile.outputs.high }}
+          PASS_RATE:    ${{ steps.risk_profile.outputs.pass_rate }}
         run: |
           python3 << 'PYEOF'
           import json, os, urllib.request, urllib.error
+
+          files = [f.strip() for f in os.environ.get("FILES", "").splitlines() if f.strip()]
           payload = json.dumps({
               "pipeline_run_id":     os.environ["RUN_ID"],
               "commit_sha":          os.environ["SHA"],
               "branch":              os.environ["BRANCH"],
               "developer":           os.environ["ACTOR"],
-              "changed_files":       ["src/app.js", "src/auth.js", "src/db.js", "src/utils.js"],
-              "files_changed_count": 4,
-              "critical_cves":       0,
-              "high_cves":           1,
-              "test_pass_rate":      0.75,
-              "target_environment":  "staging",
+              "changed_files":       files,
+              "files_changed_count": int(os.environ.get("FILE_COUNT", len(files))),
+              "critical_cves":       int(os.environ.get("CRITICAL_CVES", 0)),
+              "high_cves":           int(os.environ.get("HIGH_CVES", 0)),
+              "test_pass_rate":      float(os.environ.get("PASS_RATE", 0.9)),
           }).encode()
           try:
               req = urllib.request.Request(
@@ -50,11 +94,14 @@ jobs:
                   data=payload, headers={"Content-Type": "application/json"},
               )
               res = json.loads(urllib.request.urlopen(req, timeout=10).read())
-              rec   = res.get("recommendation", "unknown")
-              risk  = res.get("risk_score",     0.0)
-              print(f"AI: recommendation={rec}  risk={risk}")
+              rec  = res.get("recommendation", "unknown")
+              risk = res.get("risk_score", 0.0)
+              print(f"AI decision : {rec.upper()}  (risk={risk:.4f})")
+              print(f"Top factors : {res.get('top_risk_factors', [])}")
               if rec == "block":
-                  print("⚠️  AI recommends blocking — proceeding to staging anyway (non-blocking gate)")
+                  print()
+                  print("🚨 AI recommends BLOCKING this deployment.")
+                  print("   Critical/high vulnerabilities detected — remediate before deploying.")
           except urllib.error.URLError as e:
               print(f"AI service not reachable: {e.reason}")
           PYEOF
