@@ -2,6 +2,7 @@
 /**
  * DEMO FILE — intentionally insecure code for AI risk-detection demo.
  * Do NOT deploy to production.
+ * v2
  */
 
 const db = require('./db');
